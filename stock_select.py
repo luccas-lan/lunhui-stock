@@ -225,9 +225,10 @@ def score_s2(row, ind):
 def main():
     time.sleep(30)  # 延迟30秒，对应9:26:30
     today = datetime.now()
-    if not is_trade_day(today):
-        print("非交易日")
-        return
+    # ===== 临时关闭交易日判断，用于测试 =====
+    # if not is_trade_day(today):
+    #     print("非交易日")
+    #     return
 
     print("开始拉取行情...")
     df = get_stock_pool()
