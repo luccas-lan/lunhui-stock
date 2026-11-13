@@ -1,0 +1,23 @@
+name: 每日竞价选股推送
+
+on:
+  schedule:
+    # UTC 1:26 = 北京时间 9:26，周一到周五
+    - cron: '26 1 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 配置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: 安装依赖
+        run: pip install akshare pandas numpy requests
+      - name: 执行选股
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: python stock_select.py
