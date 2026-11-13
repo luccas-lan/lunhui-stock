@@ -6,6 +6,10 @@ import time
 import os
 from datetime import datetime, timedelta
 
+# ========== 配置：请求重试次数和超时 ==========
+MAX_RETRY = 5
+TIMEOUT = 30
+
 # 飞书推送
 def send_feishu(content):
     webhook = os.environ.get('FEISHU_WEBHOOK')
@@ -17,10 +21,20 @@ def send_feishu(content):
         "content": {"text": content}
     }
     try:
-        requests.post(webhook, json=data)
+        requests.post(webhook, json=data, timeout=10)
         print("推送完成")
     except Exception as e:
         print("推送失败", e)
+
+# 带重试的行情获取
+def fetch_with_retry(func, *args, **kwargs):
+    for i in range(MAX_RETRY):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"第{i+1}次请求失败: {e}")
+            time.sleep(3)
+    raise Exception("多次重试后行情接口仍无法访问")
 
 # 判断交易日
 def is_trade_day(date):
@@ -28,16 +42,16 @@ def is_trade_day(date):
         trade_dates = ak.tool_trade_date_hist_sina()
         return date.strftime('%Y%m%d') in trade_dates['trade_date'].astype(str).tolist()
     except:
-        return True  # 接口异常默认继续
+        return True
 
 # 获取初步股票池
 def get_stock_pool():
-    df = ak.stock_zh_a_spot_em()
+    df = fetch_with_retry(ak.stock_zh_a_spot_em)
     # 只留主板60、00开头
     df = df[df['代码'].str.startswith(('60', '00'))].copy()
     # 过滤ST、*ST、新股N
     df = df[~df['名称'].str.contains(r'ST|\*ST|N')].copy()
-    # 未停牌、高开2-7%、价格<55元（初步过滤，减少计算量）
+    # 未停牌、高开2-7%、价格<55元
     df = df[df['今开'] > 0].copy()
     df = df[(df['涨跌幅'] >= 2) & (df['涨跌幅'] <= 7)].copy()
     df = df[df['最新价'] < 55].copy()
@@ -48,14 +62,14 @@ def calc_indicators(code):
     end = datetime.now().strftime('%Y%m%d')
     start = (datetime.now() - timedelta(days=120)).strftime('%Y%m%d')
     try:
-        k = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+        k = fetch_with_retry(ak.stock_zh_a_hist, symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     except:
         return None
     if len(k) < 30:
         return None
     k = k.sort_values('日期').reset_index(drop=True)
 
-    # 每日涨停判断（主板10%光头涨停）
+    # 每日涨停判断
     k['涨停'] = (k['收盘'] >= round(k['收盘'].shift(1)*1.1, 2)) & (k['最高'] == k['收盘'])
     
     # 昨连板数
@@ -114,8 +128,8 @@ def score_s1(row, ind):
 def score_s2(row, ind):
     price = row['最新价']
     pct = row['涨跌幅']
-    jj_amount = row['成交额'] * 10000  # 转元
-    jj_vol = row['成交量']  # 手
+    jj_amount = row['成交额'] * 10000
+    jj_vol = row['成交量']
 
     # 母池门槛
     if ind['zuo_lb'] >= 3:
@@ -131,7 +145,6 @@ def score_s2(row, ind):
     score += (pct**3)/10
     if pct > 6.5:
         score -= 5
-    # 连板加分
     score += ind['zuo_lb']
 
     # 板形态
@@ -223,54 +236,60 @@ def score_s2(row, ind):
     return round(score, 2)
 
 def main():
-    time.sleep(30)  # 延迟30秒，对应9:26:30
+    time.sleep(30)
     today = datetime.now()
-    # ===== 临时关闭交易日判断，用于测试 =====
+    # 临时关闭交易日判断，测试用
     # if not is_trade_day(today):
     #     print("非交易日")
     #     return
 
-    print("开始拉取行情...")
-    df = get_stock_pool()
-    if df.empty:
-        send_feishu("【竞价选股】今日无符合初步条件标的")
-        return
+    try:
+        print("开始拉取行情...")
+        df = get_stock_pool()
+        if df.empty:
+            send_feishu("【竞价选股】今日无符合初步条件标的")
+            return
 
-    s1, s2 = [], []
-    for _, row in df.iterrows():
-        ind = calc_indicators(row['代码'])
-        if not ind:
-            continue
-        sc1 = score_s1(row, ind)
-        sc2 = score_s2(row, ind)
-        if sc1 > 0:
-            s1.append({"名称":row['名称'], "代码":row['代码'], "价格":row['最新价'], "分":sc1})
-        if sc2 > 0:
-            s2.append({"名称":row['名称'], "代码":row['代码'], "价格":row['最新价'], "分":sc2})
+        s1, s2 = [], []
+        for _, row in df.iterrows():
+            ind = calc_indicators(row['代码'])
+            if not ind:
+                continue
+            sc1 = score_s1(row, ind)
+            sc2 = score_s2(row, ind)
+            if sc1 > 0:
+                s1.append({"名称":row['名称'], "代码":row['代码'], "价格":row['最新价'], "分":sc1})
+            if sc2 > 0:
+                s2.append({"名称":row['名称'], "代码":row['代码'], "价格":row['最新价'], "分":sc2})
 
-    s1.sort(key=lambda x:x['分'], reverse=True)
-    s2.sort(key=lambda x:x['分'], reverse=True)
-    s1_top, s2_top = s1[:3], s2[:3]
+        s1.sort(key=lambda x:x['分'], reverse=True)
+        s2.sort(key=lambda x:x['分'], reverse=True)
+        s1_top, s2_top = s1[:3], s2[:3]
 
-    # 拼接消息
-    msg = f"【竞价选股每日推送】\n日期：{today.strftime('%Y-%m-%d')}\n\n"
-    msg += "===== 策略1：原始版轮回 前3名 =====\n"
-    if not s1_top:
-        msg += "今日无符合条件标的\n"
-    else:
-        for i,x in enumerate(s1_top,1):
-            msg += f"{i}. {x['名称']}({x['代码']})  股价：{x['价格']}元  分值：{x['分']}\n"
+        # 拼接消息
+        msg = f"【竞价选股每日推送】\n日期：{today.strftime('%Y-%m-%d')}\n\n"
+        msg += "===== 策略1：原始版轮回 前3名 =====\n"
+        if not s1_top:
+            msg += "今日无符合条件标的\n"
+        else:
+            for i,x in enumerate(s1_top,1):
+                msg += f"{i}. {x['名称']}({x['代码']})  股价：{x['价格']}元  分值：{x['分']}\n"
+        
+        msg += "\n===== 策略2：轮回V2.4 前3名 =====\n"
+        if not s2_top:
+            msg += "今日无符合条件标的\n"
+        else:
+            for i,x in enumerate(s2_top,1):
+                msg += f"{i}. {x['名称']}({x['代码']})  股价：{x['价格']}元  分值：{x['分']}\n"
+        
+        msg += "\n数据仅供研究参考，不构成投资建议"
+        print(msg)
+        send_feishu(msg)
     
-    msg += "\n===== 策略2：轮回V2.4 前3名 =====\n"
-    if not s2_top:
-        msg += "今日无符合条件标的\n"
-    else:
-        for i,x in enumerate(s2_top,1):
-            msg += f"{i}. {x['名称']}({x['代码']})  股价：{x['价格']}元  分值：{x['分']}\n"
-    
-    msg += "\n数据仅供研究参考，不构成投资建议"
-    print(msg)
-    send_feishu(msg)
+    except Exception as e:
+        err_msg = f"【竞价选股异常】\n日期：{today.strftime('%Y-%m-%d')}\n错误：{str(e)}"
+        print(err_msg)
+        send_feishu(err_msg)
 
 if __name__ == "__main__":
     main()
