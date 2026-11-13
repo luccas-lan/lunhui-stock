@@ -1,4 +1,3 @@
-import akshare as ak
 import pandas as pd
 import numpy as np
 import requests
@@ -6,9 +5,8 @@ import time
 import os
 from datetime import datetime, timedelta
 
-# ========== 配置：请求重试次数和超时 ==========
-MAX_RETRY = 5
-TIMEOUT = 30
+MAX_RETRY = 3
+TIMEOUT = 25
 
 # 飞书推送
 def send_feishu(content):
@@ -26,19 +24,84 @@ def send_feishu(content):
     except Exception as e:
         print("推送失败", e)
 
-# 带重试的行情获取
-def fetch_with_retry(func, *args, **kwargs):
-    for i in range(MAX_RETRY):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            print(f"第{i+1}次请求失败: {e}")
-            time.sleep(3)
-    raise Exception("多次重试后行情接口仍无法访问")
+# 双数据源：获取全市场实时行情
+def get_spot_data():
+    # 先试AKShare
+    try:
+        import akshare as ak
+        for i in range(MAX_RETRY):
+            try:
+                df = ak.stock_zh_a_spot_em()
+                print("使用AKShare数据源成功")
+                return df
+            except:
+                time.sleep(3)
+    except Exception as e:
+        print("AKShare不可用", e)
+
+    # AK失败，切efinance
+    try:
+        import efinance as ef
+        for i in range(MAX_RETRY):
+            try:
+                df = ef.stock.get_realtime_quotes()
+                # 字段对齐
+                df = df.rename(columns={
+                    '股票代码': '代码',
+                    '股票名称': '名称',
+                    '最新价': '最新价',
+                    '涨跌幅': '涨跌幅',
+                    '今开': '今开',
+                    '成交额': '成交额',
+                    '成交量': '成交量',
+                    '流通市值': '流通市值'
+                })
+                print("使用efinance数据源成功")
+                return df
+            except:
+                time.sleep(3)
+    except Exception as e:
+        print("efinance不可用", e)
+
+    raise Exception("所有行情数据源均访问失败")
+
+# 双数据源：获取单只股票历史K线
+def get_kline(code, start, end):
+    try:
+        import akshare as ak
+        for i in range(MAX_RETRY):
+            try:
+                k = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+                return k
+            except:
+                time.sleep(2)
+    except:
+        pass
+
+    try:
+        import efinance as ef
+        for i in range(MAX_RETRY):
+            try:
+                k = ef.stock.get_quote_history(code, beg=start, end=end)
+                k = k.rename(columns={
+                    '日期': '日期',
+                    '开盘': '开盘',
+                    '收盘': '收盘',
+                    '最高': '最高',
+                    '最低': '最低',
+                    '成交量': '成交量'
+                })
+                return k
+            except:
+                time.sleep(2)
+    except:
+        pass
+    return None
 
 # 判断交易日
 def is_trade_day(date):
     try:
+        import akshare as ak
         trade_dates = ak.tool_trade_date_hist_sina()
         return date.strftime('%Y%m%d') in trade_dates['trade_date'].astype(str).tolist()
     except:
@@ -46,12 +109,12 @@ def is_trade_day(date):
 
 # 获取初步股票池
 def get_stock_pool():
-    df = fetch_with_retry(ak.stock_zh_a_spot_em)
+    df = get_spot_data()
     # 只留主板60、00开头
-    df = df[df['代码'].str.startswith(('60', '00'))].copy()
+    df = df[df['代码'].astype(str).str.startswith(('60', '00'))].copy()
     # 过滤ST、*ST、新股N
-    df = df[~df['名称'].str.contains(r'ST|\*ST|N')].copy()
-    # 未停牌、高开2-7%、价格<55元
+    df = df[~df['名称'].astype(str).str.contains(r'ST|\*ST|N')].copy()
+    # 基础过滤
     df = df[df['今开'] > 0].copy()
     df = df[(df['涨跌幅'] >= 2) & (df['涨跌幅'] <= 7)].copy()
     df = df[df['最新价'] < 55].copy()
@@ -61,11 +124,8 @@ def get_stock_pool():
 def calc_indicators(code):
     end = datetime.now().strftime('%Y%m%d')
     start = (datetime.now() - timedelta(days=120)).strftime('%Y%m%d')
-    try:
-        k = fetch_with_retry(ak.stock_zh_a_hist, symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-    except:
-        return None
-    if len(k) < 30:
+    k = get_kline(code, start, end)
+    if k is None or len(k) < 30:
         return None
     k = k.sort_values('日期').reset_index(drop=True)
 
@@ -131,7 +191,6 @@ def score_s2(row, ind):
     jj_amount = row['成交额'] * 10000
     jj_vol = row['成交量']
 
-    # 母池门槛
     if ind['zuo_lb'] >= 3:
         return 0
     blb = jj_vol * 100 / ind['yest_vol'] if ind['yest_vol']>0 else 0
@@ -141,13 +200,11 @@ def score_s2(row, ind):
         return 0
 
     score = 0
-    # 高开+风险
     score += (pct**3)/10
     if pct > 6.5:
         score -= 5
     score += ind['zuo_lb']
 
-    # 板形态
     bs = 0
     if not ind['yest_yz'] and ind['zuo_lb']>0:
         bs += 15
@@ -159,7 +216,6 @@ def score_s2(row, ind):
     bs += {2:3, 3:5, 4:6}.get(lb, 0)
     score += bs
 
-    # 竞量昨比
     jzl = jj_vol / ind['yest_vol'] * 100 if ind['yest_vol']>0 else 0
     if jzl < 4: js = 0
     elif jzl < 5: js = 5
@@ -169,7 +225,6 @@ def score_s2(row, ind):
     else: js = 10
     score += js
 
-    # 金额评分
     if jj_amount < 20000000: ams = 3
     elif jj_amount < 30000000: ams = 5
     elif jj_amount < 50000000: ams = 8
@@ -178,14 +233,12 @@ def score_s2(row, ind):
     else: ams = 15
     score += ams
 
-    # 昨日量能
     lns = -8 if ind['liangsuo'] else 8
     if ind['diliang']: lns -= 12
     if ind['juliang']: lns -= 10
     if ind['datie']: lns -= 15
     score += lns
 
-    # 近期位置
     jq = ind['jq_zf']
     if jq < 10: jqs = 8
     elif jq < 15: jqs = 5
@@ -194,7 +247,6 @@ def score_s2(row, ind):
     else: jqs = -8
     score += jqs
 
-    # 5日线偏离
     pl = (price - ind['ma5'])/ind['ma5']*100 if ind['ma5']>0 else 0
     if pl > 12: pls = 12
     elif pl > 8: pls = 6
@@ -202,7 +254,6 @@ def score_s2(row, ind):
     else: pls = 0
     score += pls
 
-    # 竞价流通强度
     lt_yz = row['流通市值'] * 10000
     lt_gu = lt_yz / price if price>0 else 0
     jj_qd = jj_vol * 100 / lt_gu * 100 if lt_gu>0 else 0
@@ -215,7 +266,6 @@ def score_s2(row, ind):
     else: ats = 10
     score += ats
 
-    # 量能异常扣分
     kf = 0
     if jj_vol>0 and (ind['yest_vol']*0.42 / jj_vol) > 30:
         kf -= 8
@@ -223,7 +273,6 @@ def score_s2(row, ind):
         kf -= 8
     score += kf
 
-    # 市值评分
     lt_yi = row['流通市值'] / 10000
     if lt_yi < 100: szs = 8
     elif lt_yi < 200: szs = 6
@@ -238,7 +287,6 @@ def score_s2(row, ind):
 def main():
     time.sleep(30)
     today = datetime.now()
-    # 临时关闭交易日判断，测试用
     # if not is_trade_day(today):
     #     print("非交易日")
     #     return
@@ -252,7 +300,7 @@ def main():
 
         s1, s2 = [], []
         for _, row in df.iterrows():
-            ind = calc_indicators(row['代码'])
+            ind = calc_indicators(str(row['代码']))
             if not ind:
                 continue
             sc1 = score_s1(row, ind)
@@ -266,7 +314,6 @@ def main():
         s2.sort(key=lambda x:x['分'], reverse=True)
         s1_top, s2_top = s1[:3], s2[:3]
 
-        # 拼接消息
         msg = f"【竞价选股每日推送】\n日期：{today.strftime('%Y-%m-%d')}\n\n"
         msg += "===== 策略1：原始版轮回 前3名 =====\n"
         if not s1_top:
